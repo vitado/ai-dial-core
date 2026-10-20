@@ -5,7 +5,7 @@ name: SCA Scan
 on:
   schedule:
     # temporary: a supervised scheduled pilot run of the contour (removed after validation)
-    - cron: "23 13 * * *"
+    - cron: "29 14 * * *"
   workflow_dispatch:
     inputs:
       scan-tag:
