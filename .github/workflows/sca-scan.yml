@@ -3,6 +3,9 @@ name: SCA Scan
 # Pilot caller on the fork: manual runs only, the schedule is added when rolled out upstream.
 
 on:
+  schedule:
+    # temporary: a supervised scheduled pilot run of the contour (removed after validation)
+    - cron: "23 13 * * *"
   workflow_dispatch:
     inputs:
       scan-tag:
