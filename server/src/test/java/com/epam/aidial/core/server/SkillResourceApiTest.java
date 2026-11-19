@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.zip.ZipEntry;
@@ -70,6 +71,64 @@ public class SkillResourceApiTest extends ResourceBaseTest {
         }
         // the marker must not leak into the archive
         assertFalse(unpacked.containsKey(MARKER_NAME));
+    }
+
+    @Test
+    void testSubscriptionReceivesResourceAndFileEvents() {
+        String skillUrl = "skills/" + bucket + "/subscribed-skill";
+        try (EventStream events = subscribe("{\"resources\": [{\"url\": \"" + skillUrl + "\"}]}")) {
+            Map<String, byte[]> files = new LinkedHashMap<>();
+            files.put("SKILL.md", VALID_MANIFEST.getBytes(StandardCharsets.UTF_8));
+            verify(uploadSkill("/subscribed-skill", files), 200);
+            assertEvent(events, skillUrl, "CREATE");
+            assertEvent(events, skillUrl + "/files/SKILL.md", "CREATE");
+
+            verify(putSkillFile("/subscribed-skill", "scripts/run.sh", "echo hi".getBytes(StandardCharsets.UTF_8)), 200);
+            assertEvent(events, skillUrl, "UPDATE");
+            assertEvent(events, skillUrl + "/files/scripts/run.sh", "CREATE");
+
+            verify(putSkillFile("/subscribed-skill", "scripts/run.sh", "echo bye".getBytes(StandardCharsets.UTF_8)), 200);
+            assertEvent(events, skillUrl, "UPDATE");
+            assertEvent(events, skillUrl + "/files/scripts/run.sh", "UPDATE");
+
+            verify(deleteSkillFile("/subscribed-skill", "scripts/run.sh"), 200);
+            assertEvent(events, skillUrl, "UPDATE");
+            assertEvent(events, skillUrl + "/files/scripts/run.sh", "DELETE");
+
+            verify(deleteSkill("/subscribed-skill"), 200);
+            assertEvent(events, skillUrl, "DELETE");
+            assertEvent(events, skillUrl + "/files/SKILL.md", "DELETE");
+
+            // internal marker and version files are never exposed
+            assertTrue(events.events.isEmpty());
+        }
+    }
+
+    @Test
+    void testSubscriptionIsScopedToResource() {
+        String otherUrl = "skills/" + bucket + "/other-skill";
+        try (EventStream events = subscribe("{\"resources\": [{\"url\": \"" + otherUrl + "\"}]}")) {
+            Map<String, byte[]> files = Map.of("SKILL.md", VALID_MANIFEST.getBytes(StandardCharsets.UTF_8));
+            verify(uploadSkill("/unrelated-skill", files), 200);
+            verify(uploadSkill("/other-skill", files), 200);
+
+            assertEvent(events, otherUrl, "CREATE");
+            assertEvent(events, otherUrl + "/files/SKILL.md", "CREATE");
+            assertTrue(events.events.isEmpty());
+        }
+    }
+
+    @Test
+    void testSubscriptionToSkillFolderIsRejected() {
+        Response response = operationRequest("/v1/ops/resource/subscribe",
+                "{\"resources\": [{\"url\": \"skills/" + bucket + "/folder/\"}]}");
+        verify(response, 400, "resource folder is not supported: skills/" + bucket + "/folder/");
+    }
+
+    private static void assertEvent(EventStream events, String url, String action) {
+        JsonNode event = ProxyUtil.convertToObject(events.take(), JsonNode.class);
+        assertEquals(url, event.get("url").asText());
+        assertEquals(action, event.get("action").asText());
     }
 
     @Test
@@ -658,6 +717,48 @@ public class SkillResourceApiTest extends ResourceBaseTest {
         Response metadata = listMetadata("shared-item/skill-a", "Api-key", "proxyKey2");
         verify(metadata, 200);
         assertEquals("ITEM", nodeType(metadata));
+    }
+
+    @Test
+    @SneakyThrows
+    void testSharedSkillCarriesTimestamps() {
+        Map<String, byte[]> files = Map.of("SKILL.md", VALID_MANIFEST.getBytes(StandardCharsets.UTF_8));
+        verify(uploadSkill("/timestamps-skill", files), 200);
+
+        Response share = operationRequest("/v1/ops/resource/share/create", """
+                {
+                  "invitationType": "link",
+                  "resources": [
+                    { "url": "skills/%s/timestamps-skill" }
+                  ]
+                }
+                """.formatted(bucket));
+        verify(share, 200);
+        InvitationLink invitationLink = ProxyUtil.convertToObject(share.body(), InvitationLink.class);
+        assertNotNull(invitationLink);
+        verify(send(HttpMethod.GET, invitationLink.invitationLink(), "accept=true", null, "Api-key", "proxyKey2"), 200);
+
+        Response metadataResponse = listMetadata("timestamps-skill");
+        verify(metadataResponse, 200);
+        JsonNode metadata = ProxyUtil.MAPPER.readTree(metadataResponse.body());
+
+        String listRequest = """
+                {
+                  "resourceTypes": ["SKILL"],
+                  "with": "%s"
+                }
+                """;
+        JsonNode withMe = ProxyUtil.MAPPER.readTree(operationRequest("/v1/ops/resource/share/list", listRequest.formatted("me"), "Api-key", "proxyKey2").body())
+                .get("resources").get(0);
+        JsonNode byMe = ProxyUtil.MAPPER.readTree(operationRequest("/v1/ops/resource/share/list", listRequest.formatted("others")).body())
+                .get("resources").get(0);
+
+        for (JsonNode item : List.of(withMe, byMe)) {
+            assertTrue(item.get("createdAt").isNumber());
+            assertTrue(item.get("updatedAt").isNumber());
+            assertEquals(metadata.get("createdAt"), item.get("createdAt"));
+            assertEquals(metadata.get("updatedAt"), item.get("updatedAt"));
+        }
     }
 
     @Test

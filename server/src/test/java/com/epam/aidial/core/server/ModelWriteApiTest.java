@@ -1,9 +1,16 @@
 package com.epam.aidial.core.server;
 
+import com.epam.aidial.core.server.util.ProxyUtil;
+import com.epam.aidial.core.server.util.ResourceDescriptorFactory;
+import com.epam.aidial.core.storage.resource.ResourceDescriptor;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.vertx.core.http.HttpMethod;
+import lombok.SneakyThrows;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -139,6 +146,30 @@ public class ModelWriteApiTest extends ResourceBaseTest {
     }
 
     @Test
+    void testPutKeepsProviderAndLifecycleDates() {
+        String body = """
+                {
+                  "type": "chat",
+                  "endpoint": "http://localhost:7001/openai/deployments/test-model/chat/completions",
+                  "provider": "AWS",
+                  "deprecationDate": "2027-01-15",
+                  "endOfService": "2027-07-01"
+                }
+                """;
+        verify(send(HttpMethod.PUT, "/v1/models/platform/test-model-lifecycle", null, body,
+                "authorization", "admin"), 200);
+
+        Response get = send(HttpMethod.GET, "/v1/models/platform/test-model-lifecycle", null, "",
+                "authorization", "admin");
+        verify(get, 200);
+        assertTrue(get.body().contains("\"provider\":\"AWS\""), () -> "Expected provider: " + get.body());
+        assertTrue(get.body().contains("\"deprecationDate\":\"2027-01-15\""),
+                () -> "Expected deprecationDate: " + get.body());
+        assertTrue(get.body().contains("\"endOfService\":\"2027-07-01\""),
+                () -> "Expected endOfService: " + get.body());
+    }
+
+    @Test
     void testPut200HappyPathUpdate() {
         verify(send(HttpMethod.PUT, "/v1/models/platform/test-model-update", null, MODEL_BODY_NO_SECRET,
                 "authorization", "admin", "If-None-Match", "*"), 200);
@@ -192,6 +223,45 @@ public class ModelWriteApiTest extends ResourceBaseTest {
                 () -> "Plaintext secret must not appear on GET: " + get.body());
         assertFalse(get.body().contains("\"key\""),
                 () -> "Upstream key must be absent on GET: " + get.body());
+    }
+
+    @Test
+    @SneakyThrows
+    void testPutThatWouldKeepAnUnreadableUpstreamKeyIsRefused() {
+        String body = """
+                {
+                  "type": "chat",
+                  "endpoint": "http://localhost:7001/openai/deployments/test-model/chat/completions",
+                  "displayName": "%s",
+                  "upstreams": [
+                    {"endpoint": "http://localhost:7001"%s},
+                    {"endpoint": "http://localhost:7002"%s}
+                  ]
+                }
+                """;
+        String path = "/v1/models/platform/test-model-unreadable-key";
+        verify(send(HttpMethod.PUT, path, null, body.formatted("Original", ", \"key\": \"first-secret\"", ", \"key\": \"second-secret\""),
+                "authorization", "admin", "If-None-Match", "*"), 200);
+        ResourceDescriptor descriptor = ResourceDescriptorFactory.fromAnyUrl("models/platform/test-model-unreadable-key", encryptionService);
+        corruptStoredEnvelope(descriptor, "/upstreams/0", "key");
+        String storedBefore = readStoredBlob("models/platform/test-model-unreadable-key");
+
+        Response refused = send(HttpMethod.PUT, path, null, body.formatted("Changed", "", ""), "authorization", "admin");
+        verify(refused, 400);
+        assertTrue(refused.body().contains("upstreams[0].key") && !refused.body().contains("upstreams[1]"), refused::body);
+        assertFalse(refused.body().contains(CORRUPTED_CIPHERTEXT), refused::body);
+        assertEquals(storedBefore, readStoredBlob("models/platform/test-model-unreadable-key"));
+        assertTrue(send(HttpMethod.GET, path, null, "", "authorization", "admin").body().contains("\"displayName\":\"Original\""));
+
+        // A new key for the unreadable upstream is enough: the other one keeps its stored key.
+        verify(send(HttpMethod.PUT, path, null, body.formatted("Changed", ", \"key\": \"first-new-secret\"", ""),
+                "authorization", "admin"), 200);
+        JsonNode stored = ProxyUtil.MAPPER.readTree(readStoredBlob("models/platform/test-model-unreadable-key"));
+        assertEquals(ProxyUtil.MAPPER.readTree(storedBefore).at("/upstreams/1/key"), stored.at("/upstreams/1/key"));
+        assertNotEquals(ProxyUtil.MAPPER.readTree(storedBefore).at("/upstreams/0/key"), stored.at("/upstreams/0/key"));
+        // A rebuild decrypts every key; one that no longer decrypted would leave the model invalid.
+        assertEquals(200, operationRequest("/v1/ops/config/reload", null, "Authorization", "admin").status());
+        assertTrue(send(HttpMethod.GET, path, null, "", "authorization", "admin").body().contains("\"status\":\"valid\""));
     }
 
     @Test
@@ -488,7 +558,7 @@ public class ModelWriteApiTest extends ResourceBaseTest {
     }
 
     @Test
-    void testPutCreate400OnCatalogPropertiesTypeMismatch() {
+    void testPutCreate422OnCatalogPropertiesTypeMismatch() {
         String schemaId = "https://dial.epam.com/catalog-schemas/model-write-test-create";
         verify(send(HttpMethod.PUT, "/v1/catalog_schemas/platform/model-write-test-create", null,
                 catalogSchemaBody(schemaId), "authorization", "admin", "If-None-Match", "*"), 200);
@@ -496,7 +566,9 @@ public class ModelWriteApiTest extends ResourceBaseTest {
         Response put = send(HttpMethod.PUT, "/v1/models/platform/test-model-catalog-create-invalid", null,
                 modelBodyWithCatalogProperties(schemaId, "\"not-a-boolean\""),
                 "authorization", "admin", "If-None-Match", "*");
-        verify(put, 400);
+        verify(put, 422);
+        assertTrue(put.body().contains("\"field\":\"catalogProperties\""),
+                () -> "Expected a catalogProperties validation warning: " + put.body());
 
         Response get = send(HttpMethod.GET, "/v1/models/platform/test-model-catalog-create-invalid", null, "",
                 "authorization", "admin");
@@ -504,7 +576,7 @@ public class ModelWriteApiTest extends ResourceBaseTest {
     }
 
     @Test
-    void testPutUpdate400OnCatalogPropertiesTypeMismatch() {
+    void testPutUpdate422OnCatalogPropertiesTypeMismatch() {
         String schemaId = "https://dial.epam.com/catalog-schemas/model-write-test-update";
         verify(send(HttpMethod.PUT, "/v1/catalog_schemas/platform/model-write-test-update", null,
                 catalogSchemaBody(schemaId), "authorization", "admin", "If-None-Match", "*"), 200);
@@ -516,7 +588,7 @@ public class ModelWriteApiTest extends ResourceBaseTest {
         Response put = send(HttpMethod.PUT, "/v1/models/platform/test-model-catalog-update-invalid", null,
                 modelBodyWithCatalogProperties(schemaId, "\"not-a-boolean\""),
                 "authorization", "admin");
-        verify(put, 400);
+        verify(put, 422);
 
         Response get = send(HttpMethod.GET, "/v1/models/platform/test-model-catalog-update-invalid", null, "",
                 "authorization", "admin");
@@ -541,5 +613,91 @@ public class ModelWriteApiTest extends ResourceBaseTest {
         verify(get, 200);
         assertTrue(get.body().contains("\"featured\":true"),
                 () -> "Expected catalogProperties.featured=true to round-trip: " + get.body());
+    }
+
+    @Test
+    void testPutReportsCatalogAndInvariantFailuresTogether() {
+        String schemaId = "https://dial.epam.com/catalog-schemas/model-write-test-combined";
+        verify(send(HttpMethod.PUT, "/v1/catalog_schemas/platform/model-write-test-combined", null,
+                catalogSchemaBody(schemaId), "authorization", "admin", "If-None-Match", "*"), 200);
+
+        String body = """
+                {
+                  "type": "chat",
+                  "endpoint": "http://localhost:7001/openai/deployments/test-model/chat/completions",
+                  "pricing": {"unit": "char_without_whitespace", "prompt": "0.1", "cacheRead": "0.01"},
+                  "catalogSchemaId": "%s",
+                  "catalogProperties": {"featured": "not-a-boolean"}
+                }
+                """.formatted(schemaId);
+        Response put = send(HttpMethod.PUT, "/v1/models/platform/test-model-catalog-combined", null, body,
+                "authorization", "admin", "If-None-Match", "*");
+        verify(put, 422);
+        assertTrue(put.body().contains("\"field\":\"pricing\""),
+                () -> "Expected the invariant warning: " + put.body());
+        assertTrue(put.body().contains("\"field\":\"catalogProperties\""),
+                () -> "Expected the catalog warning in the same response: " + put.body());
+    }
+
+    // --- pre-write rebuild-invariant validation ---------------------------------------------------
+    // checkModel now runs the same set the rebuild runs (ConfigPostProcessor#validateModelInvariants),
+    // so a model the next rebuild would reject can no longer reach the blob store. Before this, such a
+    // write returned 500 with the blob persisted and aborted every later rebuild, including startup.
+
+    @Test
+    void testPutModelWithUpstreamInterfacesAndNoIdIsRejected() {
+        String body = """
+                {
+                  "type": "chat",
+                  "endpoint": "http://localhost:7001/openai/deployments/test-model/chat/completions",
+                  "upstreams": [
+                    {"interfaces": {"openaiChatCompletions": {"endpoint": "http://localhost:7001/v1/chat"}}}
+                  ]
+                }
+                """;
+        Response put = send(HttpMethod.PUT, "/v1/models/platform/upstream-no-id", null, body,
+                "authorization", "admin", "If-None-Match", "*");
+        verify(put, 422);
+        verify(send(HttpMethod.GET, "/v1/models/platform/upstream-no-id", null, "",
+                "authorization", "admin"), 404);
+    }
+
+    @Test
+    void testPutModelWithTranslatorButNoTranslatorModeIsRejected() {
+        String body = """
+                {
+                  "type": "chat",
+                  "baseUrl": "http://localhost:7001",
+                  "interfaces": {
+                    "anthropicMessages": {"translator": {"out": "openaiChatCompletions", "baseUrl": "http://translator"}}
+                  }
+                }
+                """;
+        Response put = send(HttpMethod.PUT, "/v1/models/platform/translator-no-mode", null, body,
+                "authorization", "admin", "If-None-Match", "*");
+        verify(put, 422);
+        assertTrue(put.body().contains("requires mode 'translator'"),
+                () -> "Expected the mode message: " + put.body());
+        verify(send(HttpMethod.GET, "/v1/models/platform/translator-no-mode", null, "",
+                "authorization", "admin"), 404);
+    }
+
+    @Test
+    void testPutModelNamingAnUnregisteredTranslatorIsAccepted() {
+        // Guards against over-tightening: a name with no registry entry leaves the interface
+        // unserved (503 at request time), not the model invalid — the rebuild tolerates it, so the
+        // write surface must too. Registering the translator later serves it with no edit here.
+        String body = """
+                {
+                  "type": "chat",
+                  "baseUrl": "http://localhost:7001",
+                  "interfaces": {
+                    "anthropicMessages": {"mode": "translator", "translator": "not-registered-yet"}
+                  }
+                }
+                """;
+        Response put = send(HttpMethod.PUT, "/v1/models/platform/unregistered-translator", null, body,
+                "authorization", "admin", "If-None-Match", "*");
+        verify(put, 200);
     }
 }
